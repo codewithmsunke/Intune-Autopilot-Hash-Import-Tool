@@ -1,7 +1,7 @@
 # Autopilot Hash Import Tool
 ![Autopilot Hash Import Tool UI](./APHashImportTool.png)
 
-A PowerShell WPF GUI application for importing Windows Autopilot device hashes to Microsoft Intune.
+A PowerShell WPF GUI application for importing Windows Autopilot device hashes into Microsoft Intune.
 
 ## Features
 
@@ -14,7 +14,7 @@ A PowerShell WPF GUI application for importing Windows Autopilot device hashes t
 ## Prerequisites
 
 - Windows 10/11 or Windows Server
-- PowerShell 5.1 or later
+- PowerShell 5.1 or later (PowerShell 7+ / pwsh is supported but the GUI requires Windows PowerShell / WPF)
 - Internet connectivity
 - Azure AD App Registration (see setup below)
 - Intune Administrator or equivalent role
@@ -63,9 +63,39 @@ A PowerShell WPF GUI application for importing Windows Autopilot device hashes t
 
 ### Running the Tool
 
+You can run the tool from Windows PowerShell (5.1+) or PowerShell 7+ (`pwsh`). The WPF GUI requires Windows and the script uses WPF APIs which are available in Windows PowerShell; running under PowerShell 7+ will still work on Windows but use `pwsh.exe` explicitly.
+
+Quick steps (PowerShell 5.1 / Windows PowerShell):
+
 1. Extract the tool folder
-2. Right-click `AutopilotHashImportTool.ps1`
-3. Select **Run with PowerShell**
+2. Right-click `AutopilotHashImportTool.ps1` and choose **Run with PowerShell**
+
+Quick steps (PowerShell 7+ / pwsh):
+
+1. Open a PowerShell terminal (Run as Administrator if required by your execution policy)
+2. Change to the tool folder, for example:
+
+```powershell
+Set-Location -Path 'D:\Proj\AutopilotHashImportTool'
+```
+
+3. Run the script with:
+
+```powershell
+pwsh -File .\AutopilotHashImportTool.ps1
+```
+
+Note: If execution is blocked by policy, you can temporarily allow scripts for the current process with:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\AutopilotHashImportTool.ps1
+```
+
+Or in Windows PowerShell (5.1):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\AutopilotHashImportTool.ps1
+```
 
 ### Import Process
 
@@ -75,9 +105,9 @@ A PowerShell WPF GUI application for importing Windows Autopilot device hashes t
 
 ### CSV Format
 
-Your CSV must contain these columns:
-- `Device Serial Number` (or similar)
-- `Hardware Hash` (or similar)
+Your CSV must contain these columns (header names are case-insensitive and small variations are accepted by the validator):
+- `Device Serial Number` (or `SerialNumber`, `Device Serial`, etc.)
+- `Hardware Hash` (or `HardwareHash`, `Hash`, etc.)
 
 Example:
 ```csv
@@ -89,19 +119,19 @@ DEF456,AAAAB3NzaC1yc2EAAAADAQABAAAC...
 ## Troubleshooting
 
 ### Authentication Fails
-- Verify app registration details in AppConfig.json
+- Verify app registration details in `Config\AppConfig.json`
 - Ensure you have appropriate Intune permissions
 - Check that admin consent has been granted
 
 ### CSV Validation Fails
-- Verify column headers match required format
-- Ensure Hardware Hash is Base64 encoded
-- Check for empty rows
+- Verify column headers match required format (see CSV Format above)
+- Ensure the Hardware Hash column contains Base64-encoded values
+- Check for empty or malformed rows
 
 ### Import Fails
 - Check network connectivity
 - Verify you're still authenticated
-- Review status log for specific error details
+- Review the status log in the GUI for specific error details
 
 ## Distribution
 
