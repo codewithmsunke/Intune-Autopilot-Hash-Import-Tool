@@ -422,6 +422,17 @@ $idleTimer.Interval = [TimeSpan]::FromMinutes(1)
 $idleTimer.Add_Tick({
     try {
         if (-not $script:isAuthenticated) { return }
+        # If an import is currently running, treat activity as ongoing and skip signing out.
+        # This prevents the session from ending while the tool is performing long-running imports.
+        try {
+            if ($syncHash.ContainsKey('IsImportRunning') -and $syncHash.IsImportRunning) {
+                # Refresh last interaction timestamp so the idle watchdog does not trigger
+                $script:lastInteractionUtc = [DateTime]::UtcNow
+                return
+            }
+        } catch {
+            # If checking the import flag fails for any reason, continue with normal timeout logic
+        }
 
         $elapsedMinutes = ([DateTime]::UtcNow - $script:lastInteractionUtc).TotalMinutes
         if ($elapsedMinutes -lt $script:IdleTimeoutMinutes) { return }
