@@ -26,6 +26,49 @@ Import-Module "$modulePath\Authentication.psm1" -Force
 Import-Module "$modulePath\GraphAPI.psm1" -Force
 Import-Module "$modulePath\CsvValidator.psm1" -Force
 
+function Stop-AuthCheckMonitor {
+    try {
+        if ($script:authCheckTimer) {
+            if ($script:authCheckTimer -is [System.Threading.Timer]) {
+                try { $script:authCheckTimer.Change([System.Threading.Timeout]::Infinite, [System.Threading.Timeout]::Infinite) | Out-Null } catch {}
+                try { $script:authCheckTimer.Dispose() } catch {}
+            } elseif ($script:authCheckTimer -is [System.Windows.Threading.DispatcherTimer]) {
+                try { $script:authCheckTimer.Stop() } catch {}
+                if ($script:authCheckTimerHandler) {
+                    try { $script:authCheckTimer.Remove_Tick($script:authCheckTimerHandler) } catch {}
+                }
+            }
+        }
+    } catch {}
+
+    if ($script:authCheckTimerState -and $script:authCheckTimerState.Stopwatch) {
+        try { $script:authCheckTimerState.Stopwatch.Stop() } catch {}
+    }
+
+    $script:authCheckTimer = $null
+    $script:authCheckTimerHandler = $null
+    $script:authCheckTimerState = $null
+    $global:AutopilotAuthCheckTimer = $null
+    $global:AutopilotAuthCheckTimerHandler = $null
+}
+
+# Clean up any lingering authentication timers from previous runs in this session
+Stop-AuthCheckMonitor
+
+# Backwards compatibility guard: ensure legacy timer state variables exist to prevent
+# stale dispatcher callbacks from older versions causing errors during script reloads
+if (-not $script:authStartTime) {
+    $script:authStartTime = Get-Date
+}
+
+if (-not $script:timerData) {
+    $script:timerData = [pscustomobject]@{
+        StartTime = Get-Date
+        TimeoutSeconds = 120
+        Job = $null
+    }
+}
+
 # Load configuration
 $configPath = "$PSScriptRoot\Config\AppConfig.json"
 if (-not (Test-Path $configPath)) {
@@ -356,6 +399,7 @@ $btnAuthenticate.Add_Click({
     if ($script:isAuthenticated) {
         # Sign Out
         try {
+            Stop-AuthCheckMonitor
             Disconnect-MgGraph -ErrorAction SilentlyContinue
             $script:isAuthenticated = $false
             Set-ControlText -Control $lblUserInfo -Text "Status: Signed out"
@@ -369,39 +413,206 @@ $btnAuthenticate.Add_Click({
             Write-StatusLog "Sign out error: $($_.Exception.Message)" "Error"
         }
     } else {
-        # Sign In
+        # Sign In - Use ThreadPool to prevent UI blocking
         try {
             Write-StatusLog "Initiating authentication..." "Info"
-            Update-Progress "Authenticating to Microsoft Graph..." $true
+            Write-StatusLog "A browser window will open. Please sign in and then return to this window." "Info"
+            Update-Progress "Waiting for authentication in browser..." $true
             $btnAuthenticate.IsEnabled = $false
             
-            $authResult = Connect-GraphInteractive `
-                -ClientId $config.ClientId `
-                -TenantId $config.TenantId
+            # Use Start-ThreadJob for non-blocking authentication
+            $authJob = Start-ThreadJob -ScriptBlock {
+                param($ClientId, $TenantId, $ModulePath)
+                
+                Import-Module "$ModulePath\Authentication.psm1" -Force
+                
+                try {
+                    $result = Connect-GraphInteractive -ClientId $ClientId -TenantId $TenantId
+                    return @{
+                        Success = $true
+                        Username = $result.Account.Username
+                        Error = $null
+                    }
+                } catch {
+                    return @{
+                        Success = $false
+                        Username = $null
+                        Error = $_.Exception.Message
+                    }
+                }
+            } -ArgumentList $config.ClientId, $config.TenantId, "$PSScriptRoot\Modules"
             
-            $script:isAuthenticated = $true
-            Set-ControlText -Control $lblUserInfo -Text "Status: [OK] Signed in as $($authResult.Account.Username)"
-            $lblUserInfo.Foreground = "#107C10"
-            $btnAuthenticate.Content = "Sign Out"
-            $btnAuthenticate.Background = "#F7630C"
-            $btnBrowse.IsEnabled = $true
-            
-            Write-StatusLog "Successfully authenticated as $($authResult.Account.Username)" "Success"
-            Write-StatusLog "You can now select a CSV file to import" "Info"
+            # Stop and detach any previous timer from earlier runs in this session
+            Stop-AuthCheckMonitor
+
+            # Create timer to poll job completion on the UI dispatcher (keeps callbacks serialized)
+            $authCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $authCheckTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+            $authCheckTimer.Tag = [pscustomobject]@{
+                Job = $authJob
+                Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                TimeoutSeconds = 120
+            }
+
+            $authCheckTimerHandler = [System.EventHandler]{
+                param($sender, $eventArgs)
+
+                $context = $sender.Tag
+                if (-not $context) { return }
+
+                $elapsedSeconds = $context.Stopwatch.Elapsed.TotalSeconds
+                $job = $context.Job
+                $timeoutSeconds = $context.TimeoutSeconds
+
+                # Check for timeout
+                if ($elapsedSeconds -ge $timeoutSeconds) {
+                    $sender.Stop()
+                    $context.Stopwatch.Stop()
+                    try {
+                        Stop-Job -Job $job -ErrorAction SilentlyContinue
+                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                    } catch {}
+
+                    Update-Progress "" $false
+                    $btnAuthenticate.IsEnabled = $true
+
+                    Write-StatusLog "⚠️ Authentication timed out after $timeoutSeconds seconds" "Warning"
+                    Write-StatusLog "Please try again or contact your administrator" "Warning"
+
+                    [System.Windows.MessageBox]::Show(
+                        "Authentication Timeout`n`n" +
+                        "The authentication process timed out after $timeoutSeconds seconds.`n`n" +
+                        "This may happen if:`n" +
+                        "• You closed the browser without completing sign-in`n" +
+                        "• You don't have access to the application`n" +
+                        "• There are network connectivity issues`n`n" +
+                        "Please try again.",
+                        "Authentication Timeout",
+                        "OK",
+                        "Warning"
+                    )
+
+                    Stop-AuthCheckMonitor
+                    return
+                }
+
+                # Check if job completed
+                if ($job.State -eq 'Completed' -or $job.State -eq 'Failed') {
+                    $sender.Stop()
+                    $context.Stopwatch.Stop()
+
+                    try {
+                        $authResult = Receive-Job -Job $job -ErrorAction Stop
+                    } catch {
+                        $authResult = @{
+                            Success = $false
+                            Error = $_.Exception.Message
+                        }
+                    } finally {
+                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                    }
+
+                    Update-Progress "" $false
+                    $btnAuthenticate.IsEnabled = $true
+
+                    if ($authResult.Success) {
+                        $script:isAuthenticated = $true
+                        Set-ControlText -Control $lblUserInfo -Text "Status: [OK] Signed in as $($authResult.Username)"
+                        $lblUserInfo.Foreground = "#107C10"
+                        $btnAuthenticate.Content = "Sign Out"
+                        $btnAuthenticate.Background = "#F7630C"
+                        $btnBrowse.IsEnabled = $true
+
+                        Write-StatusLog "Successfully authenticated as $($authResult.Username)" "Success"
+                        Write-StatusLog "You can now select a CSV file to import" "Info"
+                    } else {
+                        $errorMsg = $authResult.Error
+
+                        # Parse and display friendly error messages in UI
+                        if ($errorMsg -match "AADSTS50105") {
+                            Write-StatusLog "❌ ACCESS DENIED" "Error"
+                            Write-StatusLog "You are not assigned to this application." "Error"
+                            Write-StatusLog "Please contact your administrator to grant access." "Error"
+
+                            [System.Windows.MessageBox]::Show(
+                                "Access Denied`n`n" +
+                                "You are not assigned to the 'Autopilot Hash Import Tool' application.`n`n" +
+                                "Please contact your administrator to request access.",
+                                "Access Denied - AADSTS50105",
+                                "OK",
+                                "Warning"
+                            )
+                        } elseif ($errorMsg -match "AADSTS65001|AADSTS65004") {
+                            Write-StatusLog "❌ CONSENT REQUIRED" "Error"
+                            Write-StatusLog "Admin consent is required for this application." "Error"
+                            Write-StatusLog "Please contact your administrator." "Error"
+
+                            [System.Windows.MessageBox]::Show(
+                                "Admin Consent Required`n`n" +
+                                "This application requires administrator consent before you can use it.`n`n" +
+                                "Please contact your administrator to grant consent.",
+                                "Consent Required",
+                                "OK",
+                                "Warning"
+                            )
+                        } elseif ($errorMsg -match "Cancelled|User cancel") {
+                            Write-StatusLog "⚠️ Authentication cancelled by user" "Warning"
+
+                            [System.Windows.MessageBox]::Show(
+                                "Authentication Cancelled`n`n" +
+                                "You cancelled the sign-in process.`n`n" +
+                                "Click 'Sign In' to try again.",
+                                "Authentication Cancelled",
+                                "OK",
+                                "Information"
+                            )
+                        } elseif ($errorMsg -match "AADSTS") {
+                            if ($errorMsg -match "(AADSTS\d+)") {
+                                $errorCode = $Matches[1]
+                                Write-StatusLog "❌ Authentication Error: $errorCode" "Error"
+                            }
+                            Write-StatusLog "$errorMsg" "Error"
+
+                            [System.Windows.MessageBox]::Show(
+                                "Authentication Failed`n`n" +
+                                "Error: $errorMsg`n`n" +
+                                "Please check your internet connection and try again.",
+                                "Authentication Error",
+                                "OK",
+                                "Error"
+                            )
+                        } else {
+                            Write-StatusLog "Authentication failed: $errorMsg" "Error"
+
+                            [System.Windows.MessageBox]::Show(
+                                "Authentication Failed`n`n" +
+                                "Error: $errorMsg`n`n" +
+                                "Please ensure:`n" +
+                                "• You have internet connectivity`n" +
+                                "• App registration is configured correctly`n" +
+                                "• You have appropriate Intune permissions",
+                                "Authentication Error",
+                                "OK",
+                                "Error"
+                            )
+                        }
+                    }
+
+                    Stop-AuthCheckMonitor
+                }
+            }
+
+            $authCheckTimer.Add_Tick($authCheckTimerHandler)
+            $authCheckTimer.Start()
+
+            $script:authCheckTimer = $authCheckTimer
+            $script:authCheckTimerHandler = $authCheckTimerHandler
+            $script:authCheckTimerState = $authCheckTimer.Tag
+            $global:AutopilotAuthCheckTimer = $authCheckTimer
+            $global:AutopilotAuthCheckTimerHandler = $authCheckTimerHandler
             
         } catch {
-            Write-StatusLog "Authentication failed: $($_.Exception.Message)" "Error"
-            [System.Windows.MessageBox]::Show(
-                "Authentication failed!`n`nError: $($_.Exception.Message)`n`n" +
-                "Please ensure:`n" +
-                "• You have internet connectivity`n" +
-                "• App registration is configured correctly`n" +
-                "• You have appropriate Intune permissions",
-                "Authentication Error",
-                "OK",
-                "Error"
-            )
-        } finally {
+            Write-StatusLog "Failed to start authentication: $($_.Exception.Message)" "Error"
             Update-Progress "" $false
             $btnAuthenticate.IsEnabled = $true
         }

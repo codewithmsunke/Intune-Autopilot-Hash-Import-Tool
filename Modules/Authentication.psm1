@@ -32,13 +32,13 @@ function Connect-GraphInteractive {
         # Interactive authentication with required scopes
         Connect-MgGraph -ClientId $ClientId -TenantId $TenantId `
             -Scopes "DeviceManagementServiceConfig.ReadWrite.All","User.Read" `
-            -NoWelcome
+            -NoWelcome -ErrorAction Stop
         
         # Get context
         $context = Get-MgContext
         
         if ($null -eq $context) {
-            throw "Failed to establish Graph context"
+            throw "Failed to establish Graph context. You may not have access to this application."
         }
         
         return @{
@@ -49,7 +49,18 @@ function Connect-GraphInteractive {
         }
         
     } catch {
-        throw "Authentication failed: $($_.Exception.Message)"
+        $errorMessage = $_.Exception.Message
+        
+        # Handle specific error cases and re-throw with user-friendly messages
+        if ($errorMessage -match "AADSTS50105") {
+            throw "Access Denied: You are not assigned to this application. Please contact your administrator."
+        } elseif ($errorMessage -match "AADSTS65001|AADSTS65004") {
+            throw "Consent Required: Admin consent is required for this application. Please contact your administrator."
+        } elseif ($errorMessage -match "Cancelled|User cancel") {
+            throw "Authentication cancelled by user."
+        } else {
+            throw $errorMessage
+        }
     }
 }
 
