@@ -1,0 +1,38 @@
+# .gitignore for AutopilotHashImportTool
+# Ignore sensitive and environment-specific files
+
+# Configuration files
+Config/AppConfig.json
+
+# Log files
+*.log
+
+# PowerShell history
+*.pshistory
+
+# Credentials or secrets
+*.secret
+*.key
+*.pem
+*.pfx
+
+# VS Code settings
+.vscode/
+
+# OS-specific files
+Thumbs.db
+.DS_Store
+
+# Backup files
+*.bak
+*.tmp
+
+# Ignore compiled modules (if any)
+Modules/*.ps1c
+
+# Ignore any CSVs containing device hashes
+*.csv
+
+# Ignore any other sensitive files
+SETUP_GUIDE.md
+IMPLEMENTATION_NOTES.md

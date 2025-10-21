@@ -58,6 +58,7 @@ if ([string]::IsNullOrWhiteSpace($config.ClientId) -or $config.ClientId -like "*
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Autopilot Hash Import Tool" Height="650" Width="850"
         WindowStartupLocation="CenterScreen" ResizeMode="CanResize"
+        WindowState="Maximized"
         Background="#F5F5F5">
     <Window.Resources>
         <Style TargetType="GroupBox">
@@ -128,9 +129,14 @@ if ([string]::IsNullOrWhiteSpace($config.ClientId) -or $config.ClientId -like "*
                         <TextBlock Name="lblFileInfo" Text="No file selected" 
                                    FontSize="11" Foreground="#666"/>
                     </Border>
-                    <Button Name="btnImport" Content="Import to Autopilot" 
-                            Height="45" FontSize="14" IsEnabled="False" 
-                            Background="#107C10" Foreground="White"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+            <Button Name="btnImport" Content="Import to Autopilot" 
+                Height="45" FontSize="14" IsEnabled="False" 
+                Background="#107C10" Foreground="White" Width="170" Margin="0,0,10,0"/>
+            <Button Name="btnCopySummary" Content="Copy Summary" 
+                Height="45" FontSize="14" IsEnabled="False" 
+                Background="#0078D4" Foreground="White" Width="130"/>
+            </StackPanel>
                 </StackPanel>
             </GroupBox>
         </StackPanel>
@@ -145,7 +151,7 @@ if ([string]::IsNullOrWhiteSpace($config.ClientId) -or $config.ClientId -like "*
                 
                 <!-- Progress Bar -->
                 <StackPanel Grid.Row="0" Margin="0,0,0,10">
-                    <ProgressBar Name="progressBar" Height="35" Visibility="Collapsed" 
+                    <ProgressBar Name="progressBar" Height="20" Visibility="Collapsed" 
                                  IsIndeterminate="True" Foreground="#0078D4"/>
                     <TextBlock Name="lblProgress" Text="" FontSize="12" 
                                Margin="0,8,0,0" FontWeight="SemiBold" 
@@ -157,8 +163,10 @@ if ([string]::IsNullOrWhiteSpace($config.ClientId) -or $config.ClientId -like "*
                         Background="#FAFAFA" CornerRadius="3">
                     <ScrollViewer Name="scrollViewer" VerticalScrollBarVisibility="Auto" 
                                   Padding="10">
-                        <TextBlock Name="txtStatus" TextWrapping="Wrap" 
-                                   FontFamily="Consolas" FontSize="11"/>
+                        <RichTextBox Name="txtStatus" IsReadOnly="True" IsDocumentEnabled="True"
+                                     VerticalScrollBarVisibility="Hidden" BorderThickness="0"
+                                     Background="Transparent" FontFamily="Consolas" FontSize="11"
+                                     Padding="0"/>
                     </ScrollViewer>
                 </Border>
             </Grid>
@@ -193,6 +201,7 @@ $lblFileInfo = $window.FindName("lblFileInfo")
 $lblProgress = $window.FindName("lblProgress")
 $progressBar = $window.FindName("progressBar")
 $scrollViewer = $window.FindName("scrollViewer")
+$btnCopySummary = $window.FindName("btnCopySummary")
 
 # Global state variables
 $script:isAuthenticated = $false
@@ -226,13 +235,87 @@ function Write-StatusLog {
         default   { "•" }
     }
     
+    $paragraph = $null
+    if (-not $script:StatusParagraph) {
+        $doc = $txtStatus.Document
+        $script:StatusParagraph = New-Object System.Windows.Documents.Paragraph
+        $doc.Blocks.Clear()
+        $doc.Blocks.Add($script:StatusParagraph)
+    }
+
     $run = New-Object System.Windows.Documents.Run
     $run.Text = "[$timestamp] $icon $Message`n"
     $run.Foreground = $color
-    $txtStatus.Inlines.Add($run)
-    
+    $script:StatusParagraph.Inlines.Add($run)
+
+    # Ensure scroll to end of ScrollViewer that wraps the RichTextBox
     $scrollViewer.ScrollToEnd()
     $window.Dispatcher.Invoke([Action]{}, "Render")
+
+    # Also append exact UI output to audit log on disk (create folder if needed)
+    try {
+        $logDir = 'C:\wbg\logs'
+        if (-not (Test-Path -Path $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+        }
+
+        $logPath = Join-Path $logDir 'HashImport.log'
+        $logTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $uiIcon = $icon
+        $uiLine = "[$logTimestamp] $uiIcon $Message"
+
+        # Rotate log if it exceeds or equals 2 MB
+        if (Test-Path -Path $logPath) {
+            try {
+                $fileInfo = Get-Item -Path $logPath
+                if ($fileInfo.Length -ge 2MB) {
+                    $archiveName = "HashImport_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss")
+                    $archivePath = Join-Path $logDir $archiveName
+                    Rename-Item -Path $logPath -NewName $archiveName -Force
+                }
+            } catch {
+                # If rotation fails, continue and append to existing log
+            }
+        }
+
+        Add-Content -Path $logPath -Value $uiLine -Encoding UTF8
+    } catch {
+        # If logging fails, don't disrupt the UI
+    }
+}
+
+# Helper: Safely set text on various WPF controls (TextBlock, TextBox, etc.)
+function Set-ControlText {
+    param(
+        [Parameter(Mandatory=$true)][object]$Control,
+        [Parameter(Mandatory=$true)][string]$Text
+    )
+
+    if (-not $Control) { return }
+
+    try {
+        # Try direct property first
+        $Control.Text = $Text
+        return
+    } catch {}
+
+    try {
+        # Try common WPF Text dependency properties
+        $Control.SetValue([System.Windows.Controls.TextBlock]::TextProperty, $Text)
+        return
+    } catch {}
+
+    try {
+        $Control.SetValue([System.Windows.Controls.TextBox]::TextProperty, $Text)
+        return
+    } catch {}
+
+    try {
+        $Control.SetValue([System.Windows.Documents.Run]::TextProperty, $Text)
+        return
+    } catch {}
+
+    # Last resort: try ToString on control and ignore
 }
 
 # Status update timer - polls queue and updates GUI
@@ -258,12 +341,12 @@ function Update-Progress {
         [bool]$Show = $false
     )
     
-    if ($Show) {
+        if ($Show) {
         $progressBar.Visibility = "Visible"
-        $lblProgress.Text = $Message
+        $lblProgress.SetValue([System.Windows.Controls.TextBlock]::TextProperty, $Message)
     } else {
         $progressBar.Visibility = "Collapsed"
-        $lblProgress.Text = ""
+        $lblProgress.SetValue([System.Windows.Controls.TextBlock]::TextProperty, "")
     }
     $window.Dispatcher.Invoke([Action]{}, "Render")
 }
@@ -275,7 +358,7 @@ $btnAuthenticate.Add_Click({
         try {
             Disconnect-MgGraph -ErrorAction SilentlyContinue
             $script:isAuthenticated = $false
-            $lblUserInfo.Text = "Status: Signed out"
+            Set-ControlText -Control $lblUserInfo -Text "Status: Signed out"
             $lblUserInfo.Foreground = "#D13438"
             $btnAuthenticate.Content = "Sign In to Microsoft Graph"
             $btnAuthenticate.Background = "#0078D4"
@@ -297,7 +380,7 @@ $btnAuthenticate.Add_Click({
                 -TenantId $config.TenantId
             
             $script:isAuthenticated = $true
-            $lblUserInfo.Text = "Status: [OK] Signed in as $($authResult.Account.Username)"
+            Set-ControlText -Control $lblUserInfo -Text "Status: [OK] Signed in as $($authResult.Account.Username)"
             $lblUserInfo.Foreground = "#107C10"
             $btnAuthenticate.Content = "Sign Out"
             $btnAuthenticate.Background = "#F7630C"
@@ -334,7 +417,7 @@ $btnBrowse.Add_Click({
     
     if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $script:selectedCsvPath = $openFileDialog.FileName
-        $txtFilePath.Text = $script:selectedCsvPath
+    Set-ControlText -Control $txtFilePath -Text $script:selectedCsvPath
         
         $fileName = [System.IO.Path]::GetFileName($script:selectedCsvPath)
         Write-StatusLog "CSV file selected: $fileName" "Info"
@@ -347,13 +430,13 @@ $btnBrowse.Add_Click({
             $script:validationResult = Test-AutopilotCsv -FilePath $script:selectedCsvPath
             
             if ($script:validationResult.IsValid) {
-                $lblFileInfo.Text = "✓ Valid CSV | $($script:validationResult.DeviceCount) device(s) ready to import"
+                Set-ControlText -Control $lblFileInfo -Text "✓ Valid CSV | $($script:validationResult.DeviceCount) device(s) ready to import"
                 $lblFileInfo.Foreground = "#107C10"
                 $btnImport.IsEnabled = $true
                 Write-StatusLog "Validation passed: $($script:validationResult.DeviceCount) device(s) found" "Success"
                 Write-StatusLog "Click 'Import to Autopilot' to begin import process" "Info"
             } else {
-                $lblFileInfo.Text = "✗ Invalid CSV | Please check file format"
+                Set-ControlText -Control $lblFileInfo -Text "✗ Invalid CSV | Please check file format"
                 $lblFileInfo.Foreground = "#D13438"
                 $btnImport.IsEnabled = $false
                 Write-StatusLog "CSV validation failed" "Error"
@@ -370,7 +453,7 @@ $btnBrowse.Add_Click({
                 )
             }
         } catch {
-            $lblFileInfo.Text = "✗ Error reading CSV file"
+            Set-ControlText -Control $lblFileInfo -Text "✗ Error reading CSV file"
             $lblFileInfo.Foreground = "#D13438"
             Write-StatusLog "Error validating CSV: $($_.Exception.Message)" "Error"
         } finally {
@@ -407,12 +490,19 @@ $btnImport.Add_Click({
         $btnBrowse.IsEnabled = $false
         $btnAuthenticate.IsEnabled = $false
         $syncHash.IsImportRunning = $true
-        
+
+        # RESET PER-IMPORT STATE: prevent aggregation from previous runs
+        $syncHash.ImportComplete = $false
+        $syncHash.ImportResult = $null
+        # Clear status queue safely
+        while ($syncHash.StatusQueue.Count -gt 0) {
+            try { [void]$syncHash.StatusQueue.Dequeue() } catch { break }
+        }
+
         # Show progress
         Update-Progress "Importing devices to Autopilot (this may take several minutes)..." $true
-        
         Write-StatusLog "======================================" "Info"
-        Write-StatusLog "Starting import process for $($script:validationResult.DeviceCount) device(s)" "Info"
+        Write-StatusLog "Starting import: $($script:validationResult.DeviceCount) device(s)" "Info"
         Write-StatusLog "======================================" "Info"
         
         # Create runspace for background processing
@@ -499,72 +589,22 @@ $btnImport.Add_Click({
                 if ($syncHash.ImportSuccess -and $syncHash.ImportResult) {
                     $importResult = $syncHash.ImportResult
                     
-                    # Display detailed results
-                    Write-StatusLog "" "Info"
-                    Write-StatusLog "======================================" "Info"
-                    Write-StatusLog "Import process completed!" "Success"
-                    Write-StatusLog "  Total devices: $($importResult.TotalDevices)" "Info"
-                    Write-StatusLog "  Successfully imported: $($importResult.SuccessCount)" "Success"
-                    Write-StatusLog "  Failed: $($importResult.FailureCount)" $(if ($importResult.FailureCount -gt 0) { "Error" } else { "Info" })
-                    Write-StatusLog "======================================" "Info"
-                    
-                    if ($importResult.FailureCount -gt 0) {
-                        Write-StatusLog "" "Info"
-                        Write-StatusLog "Failed Devices - Detailed Error Information:" "Error"
-                        Write-StatusLog "======================================" "Info"
-                        
-                        foreach ($device in $importResult.FailedDevices) {
-                            Write-StatusLog "" "Info"
-                            Write-StatusLog "Device: $($device.SerialNumber)" "Error"
-                            
-                            if ($device.ErrorCode -and $device.ErrorCode -ne 0 -and $device.ErrorCode -ne -1) {
-                                Write-StatusLog "  Error Code: $($device.ErrorCode)" "Error"
-                            }
-                            
-                            if ($device.ErrorName) {
-                                $readableError = $device.ErrorName -creplace '([A-Z])', ' $1'
-                                $readableError = $readableError.Trim()
-                                Write-StatusLog "  Error Name: $readableError" "Error"
-                            }
-                            
-                            if ($device.Status) {
-                                Write-StatusLog "  Status: $($device.Status)" $(if ($device.Status -eq "timeout") { "Warning" } else { "Error" })
-                            }
-                            
-                            if ($device.ErrorName -like "*AlreadyAssigned*" -or $device.ErrorCode -eq 806) {
-                                Write-StatusLog "  ℹ This device is already registered in Autopilot" "Warning"
-                                Write-StatusLog "  Solution: Go to Intune > Devices > Windows > Enrollment > Devices" "Warning"
-                                Write-StatusLog "            Search for serial number and delete, then retry" "Warning"
-                            } elseif ($device.ErrorName -like "*Invalid*" -or $device.ErrorCode -in @(807, 808)) {
-                                Write-StatusLog "  ℹ Hardware hash or serial number format is invalid" "Warning"
-                                Write-StatusLog "  Solution: Re-run Get-WindowsAutoPilotInfo.ps1 to generate new CSV" "Warning"
-                            } elseif ($device.ErrorCode -eq -1) {
-                                Write-StatusLog "  ℹ Import may still be processing in the background" "Warning"
-                                Write-StatusLog "  Solution: Check Intune portal in a few minutes" "Warning"
-                            } elseif ($device.ExceptionMessage) {
-                                Write-StatusLog "  Exception: $($device.ExceptionMessage)" "Error"
-                            }
-                            
-                            if ($device.RegistrationId) {
-                                Write-StatusLog "  Registration ID: $($device.RegistrationId)" "Info"
-                            }
-                        }
-                        Write-StatusLog "======================================" "Info"
-                    }
-                    
                     # Create summary message
                     $summary = "Import Process Completed!`n`n"
                     $summary += "Total Devices: $($importResult.TotalDevices)`n"
                     $summary += "✓ Successfully imported: $($importResult.SuccessCount)`n"
                     
                     if ($importResult.FailureCount -gt 0) {
-                        $alreadyAssigned = ($importResult.FailedDevices | Where-Object { 
+                        # Force array to ensure .Count works correctly (single hashtable returns key count, not 1)
+                        $alreadyAssignedList = @($importResult.FailedDevices | Where-Object { 
                             $_.ErrorName -like "*AlreadyAssigned*" -or $_.ErrorCode -eq 806 
-                        }).Count
+                        })
+                        $alreadyAssigned = $alreadyAssignedList.Count
                         
-                        $timeouts = ($importResult.FailedDevices | Where-Object { 
+                        $timeoutsList = @($importResult.FailedDevices | Where-Object { 
                             $_.ErrorCode -eq -1 
-                        }).Count
+                        })
+                        $timeouts = $timeoutsList.Count
                         
                         $otherErrors = $importResult.FailureCount - $alreadyAssigned - $timeouts
                         
@@ -598,6 +638,10 @@ $btnImport.Add_Click({
                         "OK",
                         $messageType
                     )
+
+                    # Enable Copy Summary button and store last summary
+                    try { $window.FindName('btnCopySummary').IsEnabled = $true } catch {}
+                    $script:LastImportSummary = $summary
                     
                 } elseif ($syncHash.ImportError) {
                     Write-StatusLog "Import process failed: $($syncHash.ImportError)" "Error"
@@ -638,13 +682,23 @@ $btnImport.Add_Click({
     }
 })
 
+# Copy Summary button handler
+$btnCopySummary.Add_Click({
+    try {
+        if ($script:LastImportSummary) {
+            [Windows.Clipboard]::SetText($script:LastImportSummary)
+            Write-StatusLog "Summary copied to clipboard" "Success"
+        } else {
+            Write-StatusLog "No summary available to copy" "Warning"
+        }
+    } catch {
+        Write-StatusLog "Failed to copy summary to clipboard: $($_.Exception.Message)" "Error"
+    }
+})
+
 # Initialize application
 Write-StatusLog "Autopilot Hash Import Tool initialized" "Info"
 Write-StatusLog "Step 1: Click 'Sign In' to authenticate with Microsoft Graph" "Info"
-Write-StatusLog "" "Info"
-Write-StatusLog "App Configuration:" "Info"
-Write-StatusLog "  Client ID: $($config.ClientId)" "Info"
-Write-StatusLog "  Tenant ID: $($config.TenantId)" "Info"
 
 # Show window
 $null = $window.ShowDialog()

@@ -57,7 +57,7 @@ function Import-AutopilotDevices {
     
     $successCount = 0
     $failureCount = 0
-    $failedDevices = @()
+    [System.Collections.ArrayList]$failedDevices = @()
     
     # Get column names (flexible for different CSV formats)
     $csvColumns = $devices[0].PSObject.Properties.Name
@@ -68,13 +68,14 @@ function Import-AutopilotDevices {
     $totalDevices = $devices.Count
     
     foreach ($device in $devices) {
-        $currentDevice++
-        $serialNumber = $device.$serialColumn
-        $hardwareHash = $device.$hashColumn
-        
-        try {
-            Send-Status "[$currentDevice/$totalDevices] Importing device: $serialNumber" "Info"
-            
+           $currentDevice++
+           $serialNumber = $device.$serialColumn
+           $hardwareHash = $device.$hashColumn
+
+           # Write device progress line
+           Send-Status "$currentDevice of $totalDevices" "Info"
+
+           try {
             # Build JSON payload
             $json = @"
 {
@@ -108,146 +109,97 @@ function Import-AutopilotDevices {
             $attempt = 0
             $delaySeconds = 15
             
+            $finalStatus = $null
+            $finalErrorCode = $null
+            $finalErrorName = $null
             do {
                 try {
                     $response = Invoke-MgGraphRequest -Uri $pollUri -Method Get
-                    
                     # Extract state information dynamically
                     if ($id) {
                         $state = $response.state
                     } else {
                         $state = $response.Value[0].state
                     }
-                    
                     $status = $state.deviceImportStatus
                     $errorCode = $state.deviceErrorCode
                     $errorName = $state.deviceErrorName
                     $registrationId = $state.deviceRegistrationId
-                    
+                    # Show polling progress
                     Send-Status "  Polling attempt $($attempt + 1)/$maxAttempts - Status: $status" "Info"
-                    
+                    $finalStatus = $status
+                    $finalErrorCode = $errorCode
+                    $finalErrorName = $errorName
                     if ($status -eq "complete") {
-                        Send-Status "  ✓ Successfully imported: $serialNumber" "Success"
-                        if ($registrationId) {
-                            Send-Status "     Registration ID: $registrationId" "Info"
-                        }
                         $successCount++
                         break
-                        
                     } elseif ($status -eq "error") {
-                        # Display error details from Graph API response
-                        Send-Status "  ✗ Import Failed: $serialNumber" "Error"
-                        
-                        if ($errorCode -and $errorCode -ne 0) {
-                            Send-Status "     Error Code: $errorCode" "Error"
-                        }
-                        
-                        if ($errorName) {
-                            # Convert camelCase error name to readable format
-                            $readableError = $errorName -creplace '([A-Z])', ' $1'
-                            $readableError = $readableError.Trim()
-                            Send-Status "     Error: $readableError" "Error"
-                        }
-                        
-                        # Provide context-specific guidance based on error
-                        if ($errorName -like "*AlreadyAssigned*" -or $errorCode -eq 806) {
-                            Send-Status "     ℹ Device is already registered in Autopilot" "Warning"
-                            Send-Status "     Solution: Delete the device from Intune Autopilot portal and try again" "Warning"
-                        } elseif ($errorName -like "*Invalid*" -or $errorCode -in @(807, 808)) {
-                            Send-Status "     ℹ Hardware hash or serial number format is invalid" "Warning"
-                            Send-Status "     Solution: Re-run Get-WindowsAutoPilotInfo.ps1 to generate a new CSV" "Warning"
-                        } elseif ($errorCode -gt 0) {
-                            Send-Status "     ℹ Check the device hardware hash and serial number" "Warning"
-                        }
-                        
                         $failureCount++
-                        # Store detailed error information
-                        $failedDevices += @{
+                        [void]$failedDevices.Add(@{
                             SerialNumber = $serialNumber
                             ErrorCode = $errorCode
                             ErrorName = $errorName
                             Status = $status
                             RegistrationId = $registrationId
-                        }
+                        })
                         break
                     }
-                    
                 } catch {
-                    Send-Status "  ⚠ Polling error: $($_.Exception.Message)" "Warning"
+                    # Silently continue polling on transient errors
                 }
-                
                 $attempt++
                 if ($attempt -ge $maxAttempts) {
-                    Send-Status "  ✗ Timeout: $serialNumber - Max polling attempts reached" "Error"
-                    Send-Status "     ℹ Import may still be processing in the background" "Warning"
                     $failureCount++
-                    $failedDevices += @{
+                    $finalStatus = "timeout"
+                    $finalErrorCode = -1
+                    $finalErrorName = "Timeout"
+                    [void]$failedDevices.Add(@{
                         SerialNumber = $serialNumber
                         ErrorCode = -1
                         ErrorName = "Timeout"
                         Status = "timeout"
                         RegistrationId = $null
-                    }
+                    })
                     break
                 }
-                
                 Start-Sleep -Seconds $delaySeconds
-                
             } while ($true)
-            
-        } catch {
-            $ex = $_.Exception
-            Send-Status "  ✗ Failed to import: $serialNumber" "Error"
-            Send-Status "     Exception: $($ex.Message)" "Error"
-            
-            # Try to extract Graph API error details from response
-            if ($ex.Response) {
-                try {
-                    $errorResponse = $ex.Response.GetResponseStream()
-                    $reader = New-Object System.IO.StreamReader($errorResponse)
-                    $reader.BaseStream.Position = 0
-                    $reader.DiscardBufferedData()
-                    $responseBody = $reader.ReadToEnd()
-                    
-                    # Parse JSON error if available
-                    try {
-                        $errorJson = $responseBody | ConvertFrom-Json
-                        if ($errorJson.error) {
-                            Send-Status "     API Error: $($errorJson.error.message)" "Error"
-                            if ($errorJson.error.code) {
-                                Send-Status "     API Code: $($errorJson.error.code)" "Error"
-                            }
-                        }
-                    } catch {
-                        # If not JSON, show raw response
-                        Send-Status "     Details: $responseBody" "Error"
-                    }
-                } catch {
-                    # Ignore if can't read error details
-                }
+
+            # After polling, write device import status line
+            $desc = if ($finalErrorName) {
+                $finalErrorName -creplace '([A-Z])', ' $1'
+            } else {
+                $finalStatus
             }
+            $desc = $desc.Trim()
+            Send-Status "$serialNumber - $finalStatus - $finalErrorCode - $desc" $(if ($finalStatus -eq 'complete') { 'Success' } elseif ($finalStatus -eq 'error') { 'Error' } else { 'Warning' })
             
+            } catch {
+            $ex = $_.Exception
             $failureCount++
-            $failedDevices += @{
+            [void]$failedDevices.Add(@{
                 SerialNumber = $serialNumber
                 ErrorCode = 0
                 ErrorName = "Exception"
                 Status = "exception"
                 RegistrationId = $null
                 ExceptionMessage = $ex.Message
-            }
+            })
         }
     }
     
-    # Return detailed results with summary
+    # Ensure failureCount matches actual failed devices count
+    $failureCount = $failedDevices.Count
+
+    # Overall import summary
     Send-Status "" "Info"
     Send-Status "======================================" "Info"
     Send-Status "Import Summary:" "Info"
     Send-Status "  Total Devices: $totalDevices" "Info"
-    Send-Status "  Successful: $successCount" "Success"
+    Send-Status "  Successfully imported: $successCount" "Success"
     Send-Status "  Failed: $failureCount" $(if ($failureCount -gt 0) { "Error" } else { "Info" })
     Send-Status "======================================" "Info"
-    
+
     return @{
         SuccessCount = $successCount
         FailureCount = $failureCount
