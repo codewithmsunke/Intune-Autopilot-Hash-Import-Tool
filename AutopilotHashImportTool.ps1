@@ -969,8 +969,10 @@ $btnCopySummary.Add_Click({
 })
 
 # Initialize application
+Write-StatusLog "========================================" "Info"
 Write-StatusLog "Autopilot Hash Import Tool initialized" "Info"
 Write-StatusLog "Step 1: Click 'Sign In' to authenticate with Microsoft Graph" "Info"
+Write-StatusLog "========================================" "Info"
 
 # Set window icon from embedded Base64 PNG
 $iconBase64 = @'
