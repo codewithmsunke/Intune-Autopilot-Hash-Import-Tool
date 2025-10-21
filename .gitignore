@@ -33,6 +33,9 @@ Modules/*.ps1c
 # Ignore any CSVs containing device hashes
 *.csv
 
+# Ignore local tools folder (scripts used for local validation or development)
+tools/
+
 # Ignore any other sensitive files
 SETUP_GUIDE.md
 IMPLEMENTATION_NOTES.md
