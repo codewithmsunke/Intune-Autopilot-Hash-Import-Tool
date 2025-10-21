@@ -52,6 +52,14 @@ function Stop-AuthCheckMonitor {
     $global:AutopilotAuthCheckTimerHandler = $null
 }
 
+# Session idle tracking (testing at 5 minutes; increase to 30 for production)
+$script:IdleTimeoutMinutes = 5
+$script:lastInteractionUtc = [DateTime]::UtcNow
+
+function Update-LastInteraction {
+    $script:lastInteractionUtc = [DateTime]::UtcNow
+}
+
 # Clean up any lingering authentication timers from previous runs in this session
 Stop-AuthCheckMonitor
 
@@ -361,6 +369,36 @@ function Set-ControlText {
     # Last resort: try ToString on control and ignore
 }
 
+function Invoke-GraphSignOut {
+    param(
+        [string]$StatusMessage = "User signed out",
+        [string]$StatusType = "Warning"
+    )
+
+    try { Stop-AuthCheckMonitor } catch {}
+
+    try {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue
+    } catch {
+        Write-StatusLog "Sign out error: $($_.Exception.Message)" "Error"
+    }
+
+    $script:isAuthenticated = $false
+    Set-ControlText -Control $lblUserInfo -Text "Status: Signed out"
+    $lblUserInfo.Foreground = "#D13438"
+    $btnAuthenticate.Content = "Sign In to Microsoft Graph"
+    $btnAuthenticate.Background = "#0078D4"
+    $btnBrowse.IsEnabled = $false
+    $btnImport.IsEnabled = $false
+    if ($btnCopySummary) { $btnCopySummary.IsEnabled = $false }
+
+    Update-LastInteraction
+
+    if ($StatusMessage) {
+        Write-StatusLog $StatusMessage $StatusType
+    }
+}
+
 # Status update timer - polls queue and updates GUI
 $statusTimer = New-Object System.Windows.Threading.DispatcherTimer
 $statusTimer.Interval = [TimeSpan]::FromMilliseconds(100)
@@ -376,6 +414,32 @@ $statusTimer.Add_Tick({
     }
 })
 $statusTimer.Start()
+
+# Idle watchdog timer - signs out after inactivity threshold
+$idleTimer = New-Object System.Windows.Threading.DispatcherTimer
+$idleTimer.Interval = [TimeSpan]::FromMinutes(1)
+$idleTimer.Add_Tick({
+    try {
+        if (-not $script:isAuthenticated) { return }
+
+        $elapsedMinutes = ([DateTime]::UtcNow - $script:lastInteractionUtc).TotalMinutes
+        if ($elapsedMinutes -lt $script:IdleTimeoutMinutes) { return }
+
+        $timeoutMessage = "Session expired after $($script:IdleTimeoutMinutes) minute(s) of inactivity. Please sign in again."
+        Invoke-GraphSignOut -StatusMessage "Session ended due to inactivity" -StatusType "Warning"
+
+        [System.Windows.MessageBox]::Show(
+            $timeoutMessage,
+            "Session Expired",
+            "OK",
+            "Warning"
+        )
+    } catch {
+        Write-StatusLog "Idle timeout enforcement error: $($_.Exception.Message)" "Error"
+    }
+})
+$idleTimer.Start()
+$script:idleMonitorTimer = $idleTimer
 
 # Helper function: Update progress bar
 function Update-Progress {
@@ -399,22 +463,14 @@ $btnAuthenticate.Add_Click({
     if ($script:isAuthenticated) {
         # Sign Out
         try {
-            Stop-AuthCheckMonitor
-            Disconnect-MgGraph -ErrorAction SilentlyContinue
-            $script:isAuthenticated = $false
-            Set-ControlText -Control $lblUserInfo -Text "Status: Signed out"
-            $lblUserInfo.Foreground = "#D13438"
-            $btnAuthenticate.Content = "Sign In to Microsoft Graph"
-            $btnAuthenticate.Background = "#0078D4"
-            $btnBrowse.IsEnabled = $false
-            $btnImport.IsEnabled = $false
-            Write-StatusLog "User signed out" "Warning"
+            Invoke-GraphSignOut
         } catch {
             Write-StatusLog "Sign out error: $($_.Exception.Message)" "Error"
         }
     } else {
         # Sign In - Use ThreadPool to prevent UI blocking
         try {
+            Update-LastInteraction
             Write-StatusLog "Initiating authentication..." "Info"
             Write-StatusLog "A browser window will open. Please sign in and then return to this window." "Info"
             Update-Progress "Waiting for authentication in browser..." $true
@@ -598,6 +654,7 @@ $btnAuthenticate.Add_Click({
                         }
                     }
 
+                    Update-LastInteraction
                     Stop-AuthCheckMonitor
                 }
             }
@@ -628,7 +685,8 @@ $btnBrowse.Add_Click({
     
     if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $script:selectedCsvPath = $openFileDialog.FileName
-    Set-ControlText -Control $txtFilePath -Text $script:selectedCsvPath
+        Update-LastInteraction
+        Set-ControlText -Control $txtFilePath -Text $script:selectedCsvPath
         
         $fileName = [System.IO.Path]::GetFileName($script:selectedCsvPath)
         Write-StatusLog "CSV file selected: $fileName" "Info"
@@ -697,6 +755,7 @@ $btnImport.Add_Click({
     
     if ($confirmResult -eq "Yes") {
         # Disable controls during import
+        Update-LastInteraction
         $btnImport.IsEnabled = $false
         $btnBrowse.IsEnabled = $false
         $btnAuthenticate.IsEnabled = $false
@@ -896,6 +955,7 @@ $btnImport.Add_Click({
 # Copy Summary button handler
 $btnCopySummary.Add_Click({
     try {
+        Update-LastInteraction
         if ($script:LastImportSummary) {
             [Windows.Clipboard]::SetText($script:LastImportSummary)
             Write-StatusLog "Summary copied to clipboard" "Success"
