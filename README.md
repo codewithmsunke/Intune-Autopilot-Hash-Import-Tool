@@ -49,7 +49,8 @@ A PowerShell WPF GUI application for importing Windows Autopilot device hashes t
 
 ### 4. Update Configuration
 
-Edit `Config\AppConfig.json`:
+1. Copy `Config\AppConfig.json.template` to `Config\AppConfig.json`
+2. Edit `Config\AppConfig.json` with your values:
 
 ```json
 {
