@@ -157,6 +157,10 @@ No additional configuration needed! Access is controlled by:
 - ✅ All actions logged with user identity
 - ✅ Access controlled by Azure AD roles
 
+### Disclaimer
+
+This tool is provided 'as‑is' without warranty. Use it at your own risk. Test in a non‑production environment before use. The author is not responsible for data loss, system outages, or other damages arising from use of this tool. For production use, obtain approval from your IT/security team.
+
 ## Support
 
 For issues or questions:
