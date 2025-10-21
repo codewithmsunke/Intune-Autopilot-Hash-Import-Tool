@@ -1,4 +1,5 @@
 # Autopilot Hash Import Tool
+![Autopilot Hash Import Tool UI](./APHashImportTool.png)
 
 A PowerShell WPF GUI application for importing Windows Autopilot device hashes to Microsoft Intune.
 
