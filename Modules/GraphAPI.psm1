@@ -75,6 +75,8 @@ function Import-AutopilotDevices {
            # Write device progress line
            Send-Status "$currentDevice of $totalDevices" "Info"
 
+           
+
            try {
             # Build JSON payload
             $json = @"
@@ -114,6 +116,8 @@ function Import-AutopilotDevices {
             $finalErrorName = $null
             do {
                 try {
+                    
+
                     $response = Invoke-MgGraphRequest -Uri $pollUri -Method Get
                     # Extract state information dynamically
                     if ($id) {

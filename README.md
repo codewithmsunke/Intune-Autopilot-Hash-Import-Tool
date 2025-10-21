@@ -97,6 +97,10 @@ Or in Windows PowerShell (5.1):
 powershell -ExecutionPolicy Bypass -File .\AutopilotHashImportTool.ps1
 ```
 
+### Configuration: Max import duration
+
+You can control the maximum allowed duration for a single import by setting `MaxImportMinutes` in `Config\AppConfig.json`. The default is 60 minutes. If an import exceeds this duration the tool will forcefully stop the import and perform cleanup.
+
 ### Import Process
 
 1. **Authenticate**: Click "Sign In" and enter your credentials

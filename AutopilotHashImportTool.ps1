@@ -184,6 +184,7 @@ if ([string]::IsNullOrWhiteSpace($config.ClientId) -or $config.ClientId -like "*
             <Button Name="btnImport" Content="Import to Autopilot" 
                 Height="45" FontSize="14" IsEnabled="False" 
                 Background="#107C10" Foreground="White" Width="170" Margin="0,0,10,0"/>
+            <!-- Cancel Import button removed -->
             <Button Name="btnCopySummary" Content="Copy Summary" 
                 Height="45" FontSize="14" IsEnabled="False" 
                 Background="#0078D4" Foreground="White" Width="130"/>
@@ -263,6 +264,9 @@ $script:validationResult = $null
 $syncHash = [hashtable]::Synchronized(@{})
 $syncHash.StatusQueue = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
 $syncHash.IsImportRunning = $false
+
+# Default maximum import duration (minutes). Can be overridden in Config\AppConfig.json by adding "MaxImportMinutes": 60
+$script:MaxImportMinutes = if ($config.PSObject.Properties.Name -contains 'MaxImportMinutes') { [int]$config.MaxImportMinutes } else { 60 }
 
 # Helper function: Write to status log
 function Write-StatusLog {
@@ -368,6 +372,48 @@ function Set-ControlText {
     } catch {}
 
     # Last resort: try ToString on control and ignore
+}
+
+function Finish-ImportCleanup {
+    param(
+        $timerTag = $null,
+        [string]$Reason = "Completed"
+    )
+
+    try {
+        Write-StatusLog "Finalizing import cleanup: $Reason" "Info"
+
+        # Stop any running completion timer if provided
+        if ($timerTag -and $timerTag.Timer -is [System.Windows.Threading.DispatcherTimer]) {
+            try { $timerTag.Timer.Stop() } catch {}
+        }
+
+        # Dispose PowerShell and runspace if provided
+        if ($timerTag -and $timerTag.PowerShell) {
+            try { $timerTag.PowerShell.Dispose() } catch {}
+        }
+        if ($timerTag -and $timerTag.Runspace) {
+            try { $timerTag.Runspace.Close(); $timerTag.Runspace.Dispose() } catch {}
+        }
+
+    } catch {
+        # Ignore cleanup errors but log them
+        Write-StatusLog "Cleanup error: $($_.Exception.Message)" "Warning"
+    } finally {
+        # Reset syncHash flags and re-enable UI controls
+        try { $syncHash.ImportComplete = $false } catch {}
+        try { $syncHash.ImportSuccess = $false } catch {}
+        try { $syncHash.ImportResult = $null } catch {}
+        try { $syncHash.ImportError = $null } catch {}
+        try { $syncHash.IsImportRunning = $false } catch {}
+
+        $btnImport.IsEnabled = $true
+        $btnBrowse.IsEnabled = $true
+        $btnAuthenticate.IsEnabled = $true
+    
+        Update-Progress "" $false
+        Update-LastInteraction
+    }
 }
 
 function Invoke-GraphSignOut {
@@ -768,9 +814,10 @@ $btnImport.Add_Click({
     if ($confirmResult -eq "Yes") {
         # Disable controls during import
         Update-LastInteraction
-        $btnImport.IsEnabled = $false
-        $btnBrowse.IsEnabled = $false
-        $btnAuthenticate.IsEnabled = $false
+    $btnImport.IsEnabled = $false
+    $btnBrowse.IsEnabled = $false
+    $btnAuthenticate.IsEnabled = $false
+    
         $syncHash.IsImportRunning = $true
 
         # RESET PER-IMPORT STATE: prevent aggregation from previous runs
@@ -793,7 +840,7 @@ $btnImport.Add_Click({
         $runspace.ThreadOptions = "ReuseThread"
         $runspace.Open()
         
-        # Pass variables to runspace
+    # Pass variables to runspace
         $runspace.SessionStateProxy.SetVariable("syncHash", $syncHash)
         $runspace.SessionStateProxy.SetVariable("csvPath", $script:selectedCsvPath)
         $runspace.SessionStateProxy.SetVariable("modulePath", "$PSScriptRoot\Modules")
@@ -845,7 +892,10 @@ $btnImport.Add_Click({
             
         }).AddArgument($syncHash).AddArgument($script:selectedCsvPath).AddArgument("$PSScriptRoot\Modules")
         
-        # Start async execution
+    # Record import start time for timeout enforcement
+    $syncHash.ImportStartTime = Get-Date
+
+    # Start async execution
         $asyncResult = $ps.BeginInvoke()
         
         # Create completion monitoring timer
@@ -855,18 +905,20 @@ $btnImport.Add_Click({
             PowerShell = $ps
             Runspace = $runspace
             AsyncResult = $asyncResult
+            Timer = $completionTimer
+            StartTime = $syncHash.ImportStartTime
         }
         
         $completionTimer.Add_Tick({
             param($sender, $e)
             
-            # Check if import is complete
+            # Check for completion, stuck runspace, or timeout
+            $timerTag = $sender.Tag
+
+            # If syncHash indicates completion, proceed
             if ($syncHash.ImportComplete) {
                 $sender.Stop()
-                
-                # Hide progress
-                Update-Progress "" $false
-            
+
                 # Process results
                 if ($syncHash.ImportSuccess -and $syncHash.ImportResult) {
                     $importResult = $syncHash.ImportResult
@@ -934,33 +986,49 @@ $btnImport.Add_Click({
                         "Error"
                     )
                 }
-                
-                # Cleanup
-                $timerTag = $sender.Tag
-                try {
-                    $timerTag.AsyncResult.AsyncWaitHandle.Close()
-                    $timerTag.PowerShell.Dispose()
-                    $timerTag.Runspace.Close()
-                    $timerTag.Runspace.Dispose()
-                } catch {
-                    # Ignore cleanup errors
-                }
-                
-                # Reset state
-                $syncHash.ImportComplete = $false
-                $syncHash.ImportSuccess = $false
-                $syncHash.ImportResult = $null
-                $syncHash.ImportError = $null
-                $syncHash.IsImportRunning = $false
-                
-                # Re-enable controls
-                $btnImport.IsEnabled = $true
-                $btnBrowse.IsEnabled = $true
-                $btnAuthenticate.IsEnabled = $true
+
+                # Perform centralized cleanup
+                Finish-ImportCleanup -timerTag $timerTag -Reason "Normal Completion"
+                return
             }
+
+            # If the underlying PowerShell has completed but ImportComplete wasn't set (stuck runspace/finally not hit), treat as completed
+            try {
+                if ($timerTag.AsyncResult -and $timerTag.AsyncResult.IsCompleted) {
+                    Write-StatusLog "Detected completed PowerShell async result but ImportComplete not set. Forcing cleanup." "Warning"
+                    Finish-ImportCleanup -timerTag $timerTag -Reason "AsyncResult Completed - Forcing Cleanup"
+                    return
+                }
+            } catch {}
+
+            try {
+                if ($timerTag.PowerShell -and $timerTag.PowerShell.InvocationStateInfo -and $timerTag.PowerShell.InvocationStateInfo.State -ne 'Running') {
+                    Write-StatusLog "PowerShell invocation state: $($timerTag.PowerShell.InvocationStateInfo.State) - Forcing cleanup" "Warning"
+                    Finish-ImportCleanup -timerTag $timerTag -Reason "PowerShell Not Running - Forcing Cleanup"
+                    return
+                }
+            } catch {}
+
+            # Enforce max import duration
+            try {
+                if ($timerTag.StartTime) {
+                    $elapsed = (Get-Date) - [DateTime]$timerTag.StartTime
+                    if ($elapsed.TotalMinutes -ge $script:MaxImportMinutes) {
+                        Write-StatusLog "Import exceeded maximum duration of $($script:MaxImportMinutes) minutes. Forcing timeout and cleanup." "Warning"
+                        # Mark as timed out
+                        try { $syncHash.ImportError = 'Import timed out' } catch {}
+                        try { $syncHash.ImportSuccess = $false } catch {}
+                        try { $syncHash.ImportComplete = $true } catch {}
+                        Finish-ImportCleanup -timerTag $timerTag -Reason "Max Duration Exceeded"
+                        return
+                    }
+                }
+            } catch {}
         })
         
         $completionTimer.Start()
+        # Expose completion timer to script scope for cancellation handling
+        $script:completionTimer = $completionTimer
     }
 })
 
@@ -978,6 +1046,8 @@ $btnCopySummary.Add_Click({
         Write-StatusLog "Failed to copy summary to clipboard: $($_.Exception.Message)" "Error"
     }
 })
+
+
 
 # Initialize application
 Write-StatusLog "========================================" "Info"

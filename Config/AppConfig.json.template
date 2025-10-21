@@ -2,4 +2,6 @@
     "ClientId": "YOUR_APPLICATION_CLIENT_ID",
     "TenantId": "YOUR_TENANT_ID",
     "GraphApiVersion": "beta"
+    ,
+    "MaxImportMinutes": 60
 }
