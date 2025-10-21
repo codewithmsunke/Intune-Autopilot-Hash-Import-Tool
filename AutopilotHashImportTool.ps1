@@ -271,7 +271,8 @@ function Write-StatusLog {
         [string]$Type = "Info"
     )
     
-    $timestamp = Get-Date -Format "HH:mm:ss"
+    $timestampFormat = "yyyy-MM-dd hh:mm:ss tt"
+    $timestamp = Get-Date -Format $timestampFormat
     $color = switch ($Type) {
         "Success" { "#107C10" }
         "Warning" { "#F7630C" }
@@ -311,7 +312,7 @@ function Write-StatusLog {
         }
 
         $logPath = Join-Path $logDir 'HashImport.log'
-        $logTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logTimestamp = Get-Date -Format $timestampFormat
         $uiIcon = $icon
         $uiLine = "[$logTimestamp] $uiIcon $Message"
 
