@@ -20,6 +20,109 @@
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName System.Windows.Forms
 
+# Prevent running a second instance of the tool for this user by using a named mutex.
+# If another instance is already running, try to acquire the existing mutex (this will succeed if it was abandoned).
+try {
+    # Use a session-local mutex to avoid cross-session conflicts (Global can be held by other user sessions)
+    $mutexName = "Local\AutopilotHashImportTool_$env:USERNAME"
+    $created = $false
+    $script:InstanceMutex = New-Object System.Threading.Mutex($false, $mutexName, ([ref]$created))
+
+    if (-not $created) {
+        # The named mutex already exists. Try to acquire it briefly to detect an abandoned mutex
+        $acquired = $false
+        try {
+            try {
+                if ($script:InstanceMutex.WaitOne(0)) { $acquired = $true }
+            } catch [System.Threading.AbandonedMutexException] {
+                # The existing mutex was abandoned by a previous process. We now own it.
+                $acquired = $true
+            }
+        } catch {
+            # If WaitOne fails for unexpected reasons, leave $acquired = $false and fall back to restore logic
+            $acquired = $false
+        }
+
+        if ($acquired) {
+            # Successfully acquired ownership of the existing mutex — proceed and retain ownership for this process lifetime.
+        } else {
+            # Could not acquire the existing mutex. Attempt to locate and restore the already-running window by title.
+            try {
+                $windowTitle = 'Autopilot Hash Import Tool'
+
+                $sig = @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class Win32 {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+}
+'@
+
+                Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue | Out-Null
+
+                $found = $false
+                $targetHwnd = [IntPtr]::Zero
+                $enumProc = [Win32+EnumWindowsProc]{
+                    param($hWnd, $lParam)
+                    try {
+                        # Do not skip non-visible windows - some WPF windows are hidden from the taskbar
+                        $sb = New-Object System.Text.StringBuilder 256
+                        [Win32]::GetWindowText($hWnd, $sb, $sb.Capacity) | Out-Null
+                        $title = $sb.ToString()
+                        # Use case-insensitive contains match to be more tolerant of small title changes
+                        if ($title -and $title.IndexOf($windowTitle, [System.StringComparison]::InvariantCultureIgnoreCase) -ge 0) {
+                            $script:FoundWindow = $hWnd
+                            $targetHwnd = $hWnd
+                            $found = $true
+                            return $false
+                        }
+                    } catch {}
+                    return $true
+                }
+
+                [Win32]::EnumWindows($enumProc, [IntPtr]::Zero) | Out-Null
+
+                if ($found -and $targetHwnd -ne [IntPtr]::Zero) {
+                    # SW_RESTORE = 9
+                    try { [Win32]::ShowWindow($targetHwnd, 9) | Out-Null } catch {}
+                    try { [Win32]::SetForegroundWindow($targetHwnd) | Out-Null } catch {}
+                    exit
+                } else {
+                    [System.Windows.MessageBox]::Show(
+                        "Another instance of Autopilot Hash Import Tool is already running. Only one instance is allowed.",
+                        "Instance Already Running",
+                        "OK",
+                        "Warning"
+                    )
+                    exit
+                }
+            } catch {
+                [System.Windows.MessageBox]::Show(
+                    "Another instance of Autopilot Hash Import Tool is already running. Only one instance is allowed.",
+                    "Instance Already Running",
+                    "OK",
+                    "Warning"
+                )
+                exit
+            }
+        }
+    }
+} catch {
+    # If mutex creation fails for any reason, allow execution but log the condition
+    Write-Host "Warning: failed to create instance mutex: $($_.Exception.Message)"
+}
+
 # Import modules
 $modulePath = "$PSScriptRoot\Modules"
 Import-Module "$modulePath\Authentication.psm1" -Force
@@ -255,6 +358,63 @@ $progressBar = $window.FindName("progressBar")
 $scrollViewer = $window.FindName("scrollViewer")
 $btnCopySummary = $window.FindName("btnCopySummary")
 
+
+# Create a NotifyIcon (system tray) to enable minimize-to-tray and restore behavior
+$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+$notifyIcon.Visible = $false
+$notifyIcon.Text = "Autopilot Hash Import Tool"
+# Ensure an icon is assigned so balloon tips are shown on Windows
+try {
+    $notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
+    $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+} catch {}
+# Track last balloon time to avoid spam
+$script:LastBalloonUtc = $null
+
+# Restore window when user double-clicks the tray icon
+$notifyIcon.add_DoubleClick({
+    try {
+        if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }
+        $window.Activate()
+        $notifyIcon.Visible = $false
+    } catch {}
+})
+
+# When the window is minimized during an import, show the tray icon so the user can restore it
+# Do not hide the taskbar entry; keep the window restorable from the taskbar as well.
+$window.add_StateChanged({
+    try {
+        if ($window.WindowState -eq 'Minimized' -and $syncHash.IsImportRunning) {
+            $notifyIcon.Visible = $true
+            # Show a balloon tip once every 2 minutes to remind user import is running
+            $now = [DateTime]::UtcNow
+            $canShow = $false
+            if (-not $script:LastBalloonUtc) { $canShow = $true } else { if (($now - $script:LastBalloonUtc).TotalMinutes -ge 2) { $canShow = $true } }
+            if ($canShow) {
+                try {
+                    $notifyIcon.Visible = $true
+                    $notifyIcon.BalloonTipTitle = "Autopilot Import Running"
+                    $notifyIcon.BalloonTipText = "Import is running in the background."
+                    $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+                    # Use explicit timeout (milliseconds)
+                    $notifyIcon.ShowBalloonTip(5000)
+                    $script:LastBalloonUtc = $now
+                } catch { Write-StatusLog "Failed to show balloon tip: $($_.Exception.Message)" "Warning" }
+            }
+        } else {
+            $notifyIcon.Visible = $false
+        }
+    } catch {}
+})
+
+# Clean up notify icon and release mutex on window close
+$window.add_Closing({
+    try { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } catch {}
+    try {
+        if ($script:InstanceMutex) { $script:InstanceMutex.ReleaseMutex(); $script:InstanceMutex.Dispose() }
+    } catch {}
+})
+
 # Global state variables
 $script:isAuthenticated = $false
 $script:selectedCsvPath = $null
@@ -284,11 +444,12 @@ function Write-StatusLog {
         default   { "#333333" }
     }
     
+    # Use simple ASCII markers for icons to avoid encoding issues in different consoles
     $icon = switch ($Type) {
-        "Success" { "✓" }
-        "Warning" { "⚠" }
-        "Error"   { "✗" }
-        default   { "•" }
+        "Success" { "[OK]" }
+        "Warning" { "[!]" }
+        "Error"   { "[X]" }
+        default   { "[-]" }
     }
     
     $paragraph = $null
@@ -373,6 +534,9 @@ function Set-ControlText {
 
     # Last resort: try ToString on control and ignore
 }
+
+
+
 
 function Finish-ImportCleanup {
     param(
@@ -756,14 +920,14 @@ $btnBrowse.Add_Click({
         try {
             $script:validationResult = Test-AutopilotCsv -FilePath $script:selectedCsvPath
             
-            if ($script:validationResult.IsValid) {
-                Set-ControlText -Control $lblFileInfo -Text "✓ Valid CSV | $($script:validationResult.DeviceCount) device(s) ready to import"
+                if ($script:validationResult.IsValid) {
+                Set-ControlText -Control $lblFileInfo -Text "[OK] Valid CSV | $($script:validationResult.DeviceCount) device(s) ready to import"
                 $lblFileInfo.Foreground = "#107C10"
                 $btnImport.IsEnabled = $true
                 Write-StatusLog "Validation passed: $($script:validationResult.DeviceCount) device(s) found" "Success"
                 Write-StatusLog "Click 'Import to Autopilot' to begin import process" "Info"
             } else {
-                Set-ControlText -Control $lblFileInfo -Text "✗ Invalid CSV | Please check file format"
+                Set-ControlText -Control $lblFileInfo -Text "[X] Invalid CSV | Please check file format"
                 $lblFileInfo.Foreground = "#D13438"
                 $btnImport.IsEnabled = $false
                 Write-StatusLog "CSV validation failed" "Error"
@@ -788,6 +952,14 @@ $btnBrowse.Add_Click({
         }
     }
 })
+
+# Diagnostics button click handler
+$btnDiagnostics = $window.FindName("btnDiagnostics")
+if ($btnDiagnostics) {
+    $btnDiagnostics.Add_Click({
+        try { Show-DiagnosticsDialog } catch { Write-StatusLog "Diagnostics error: $($_.Exception.Message)" "Error" }
+    })
+}
 
 # Event: Import Button Click
 $btnImport.Add_Click({
@@ -819,6 +991,7 @@ $btnImport.Add_Click({
     $btnAuthenticate.IsEnabled = $false
     
         $syncHash.IsImportRunning = $true
+        try { $notifyIcon.Visible = $true } catch {}
 
         # RESET PER-IMPORT STATE: prevent aggregation from previous runs
         $syncHash.ImportComplete = $false
@@ -886,9 +1059,9 @@ $btnImport.Add_Click({
                 
                 # Queue error message
                 & $statusCallback "EXCEPTION: $($_.Exception.Message)" "Error"
-            } finally {
-                $syncHash.ImportComplete = $true
-            }
+                } finally {
+                    $syncHash.ImportComplete = $true
+                }
             
         }).AddArgument($syncHash).AddArgument($script:selectedCsvPath).AddArgument("$PSScriptRoot\Modules")
         
@@ -926,7 +1099,7 @@ $btnImport.Add_Click({
                     # Create summary message
                     $summary = "Import Process Completed!`n`n"
                     $summary += "Total Devices: $($importResult.TotalDevices)`n"
-                    $summary += "✓ Successfully imported: $($importResult.SuccessCount)`n"
+                    $summary += "[OK] Successfully imported: $($importResult.SuccessCount)`n"
                     
                     if ($importResult.FailureCount -gt 0) {
                         # Force array to ensure .Count works correctly (single hashtable returns key count, not 1)
@@ -944,13 +1117,13 @@ $btnImport.Add_Click({
                         
                         $summary += "`nFailed Imports:`n"
                         if ($alreadyAssigned -gt 0) {
-                            $summary += "  ⚠ $alreadyAssigned already registered in Autopilot`n"
+                            $summary += "  [!] $alreadyAssigned already registered in Autopilot`n"
                         }
                         if ($timeouts -gt 0) {
-                            $summary += "  ⏱ $timeouts timed out (may still be processing)`n"
+                            $summary += "  [TMO] $timeouts timed out (may still be processing)`n"
                         }
                         if ($otherErrors -gt 0) {
-                            $summary += "  ✗ $otherErrors failed with errors`n"
+                            $summary += "  [X] $otherErrors failed with errors`n"
                         }
                         
                         $summary += "`nSee status log above for detailed error information and solutions."
@@ -1072,6 +1245,14 @@ $bitmap.DecodePixelHeight = 128 # Set icon height to 64px
 $bitmap.EndInit()
 $bitmap.Freeze()
 $window.Icon = $bitmap
+
+# If we successfully created a bitmap icon, set the NotifyIcon to use the same icon
+try {
+    if ($notifyIcon -and $bitmap) {
+        $hIcon = $bitmap.GetHicon()
+        $notifyIcon.Icon = [System.Drawing.Icon]::FromHandle($hIcon)
+    }
+} catch {}
 
 # Show window
 $null = $window.ShowDialog()

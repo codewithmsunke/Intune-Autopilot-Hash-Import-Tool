@@ -48,8 +48,17 @@ function Import-AutopilotDevices {
         throw "Not connected to Microsoft Graph. Please authenticate first."
     }
     
-    # Read CSV file
-    $devices = Import-Csv -Path $CsvPath
+    # Read CSV file - force into an array to handle single-row files correctly
+    $devices = @(Import-Csv -Path $CsvPath)
+    if (-not $devices -or $devices.Count -eq 0) {
+        Send-Status "CSV file contains no device rows or could not be read: $CsvPath" "Error"
+        return @{
+            SuccessCount = 0
+            FailureCount = 0
+            FailedDevices = @()
+            TotalDevices = 0
+        }
+    }
     
     $graphApiVersion = "beta"
     $Resource = "deviceManagement/importedWindowsAutopilotDeviceIdentities"
@@ -60,7 +69,8 @@ function Import-AutopilotDevices {
     [System.Collections.ArrayList]$failedDevices = @()
     
     # Get column names (flexible for different CSV formats)
-    $csvColumns = $devices[0].PSObject.Properties.Name
+    $firstRow = $devices | Select-Object -First 1
+    $csvColumns = $firstRow.PSObject.Properties.Name
     $serialColumn = $csvColumns | Where-Object { $_ -match "Serial|Device Serial" } | Select-Object -First 1
     $hashColumn = $csvColumns | Where-Object { $_ -match "Hardware|Hash" } | Select-Object -First 1
     
