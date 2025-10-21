@@ -37,7 +37,6 @@ A PowerShell WPF GUI application for importing Windows Autopilot device hashes t
 2. Select **Microsoft Graph** > **Delegated permissions**
 3. Add:
    - `DeviceManagementServiceConfig.ReadWrite.All`
-   - `Device.ReadWrite.All`
    - `User.Read`
 4. Click **Grant admin consent**
 

@@ -31,7 +31,7 @@ function Connect-GraphInteractive {
         
         # Interactive authentication with required scopes
         Connect-MgGraph -ClientId $ClientId -TenantId $TenantId `
-            -Scopes "DeviceManagementServiceConfig.ReadWrite.All","Device.ReadWrite.All","User.Read" `
+            -Scopes "DeviceManagementServiceConfig.ReadWrite.All","User.Read" `
             -NoWelcome
         
         # Get context
